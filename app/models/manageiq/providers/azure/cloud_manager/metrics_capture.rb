@@ -4,7 +4,8 @@ class ManageIQ::Providers::Azure::CloudManager::MetricsCapture < ManageIQ::Provi
   # Linux, Windows counters
   CPU_METERS     = ["\\Processor Information(_Total)\\% Processor Time",
                     "\\Processor(_Total)\\% Processor Time",
-                    "\\Processor\\PercentProcessorTime"].freeze
+                    "\\Processor\\PercentProcessorTime",
+                    "Percentage CPU"].freeze  
 
   NETWORK_METERS = ["\\NetworkInterface\\BytesTotal"].freeze # Linux (No windows counter available)
 
@@ -21,17 +22,17 @@ class ManageIQ::Providers::Azure::CloudManager::MetricsCapture < ManageIQ::Provi
   COUNTER_INFO = [
     {
       :native_counters       => CPU_METERS,
-      :calculation           => ->(stat) { stat.first },
+      :calculation           => ->(stat) { stat },
       :vim_style_counter_key => "cpu_usage_rate_average"
     },
     {
       :native_counters       => NETWORK_METERS,
-      :calculation           => ->(stat) { stat.first / 1.kilobyte },
+      :calculation           => ->(stat) { stat / 1.kilobyte },
       :vim_style_counter_key => "net_usage_rate_average",
     },
     {
       :native_counters       => MEMORY_METERS,
-      :calculation           => ->(stat) { stat.first },
+      :calculation           => ->(stat) { stat },
       :vim_style_counter_key => "mem_usage_absolute_average",
     },
     {
@@ -94,8 +95,8 @@ class ManageIQ::Providers::Azure::CloudManager::MetricsCapture < ManageIQ::Provi
       # This is just for consistency, to produce a :connect benchmark
       Benchmark.realtime_block(:connect) {}
       target.ext_management_system.with_provider_connection do |conn|
-        with_metrics_services(conn) do |metrics_conn, storage_conn|
-          perf_capture_data_azure(metrics_conn, storage_conn, start_time, end_time)
+        with_metrics_services(conn) do |metrics_conn|
+          perf_capture_data_azure(metrics_conn, start_time, end_time)
         end
       end
     rescue Exception => err
@@ -110,89 +111,59 @@ class ManageIQ::Providers::Azure::CloudManager::MetricsCapture < ManageIQ::Provi
 
   def with_metrics_services(connection)
     metrics_conn = Azure::Armrest::Insights::MetricsService.new(connection)
-    storage_conn = Azure::Armrest::StorageAccountService.new(connection)
-
-    yield metrics_conn, storage_conn
+    yield metrics_conn
   end
 
-  def storage_accounts(storage_account_service)
-    @storage_accounts ||= storage_account_service.list_all
-  end
 
-  def perf_capture_data_azure(metrics_conn, storage_conn, start_time, end_time)
+
+  def perf_capture_data_azure(metrics_conn, start_time, end_time)
     start_time -= 1.minute # Get one extra minute so we can build the 20-second intermediate values
-
     counters                = get_counters(metrics_conn)
-    metrics_by_counter_name = metrics_by_counter_name(storage_conn, counters, start_time, end_time)
-    counter_values_by_ts    = counter_values_by_timestamp(metrics_by_counter_name)
+
+    
+    counter_values_by_ts    = {}
+
+    counters.each do |md|
+      filter = "metricnames=#{md.name.value}"
+      filter << "&timespan=#{start_time.iso8601.gsub(/\+[0-9]*:[0-9]*/, "Z")}/#{end_time.iso8601.gsub(/\+[0-9]*:[0-9]*/, "Z")}"
+      filter << "&interval=#{INTERVAL_1_MINUTE}"
+      metrics = metrics_conn.list_metrics(azure_vm_id,filter)
+
+      COUNTER_INFO.each do |i|
+        if i[:native_counters].flat_map.include?(md.name.value)
+          metrics[0].timeseries[0].data.each do |mtd|
+               value = i[:calculation].call(mtd["average"])
+               ts = DateTime.parse(mtd["timeStamp"]).to_date
+               last_ts = ts - 1.minute
+
+               ## # For (temporary) symmetry with VIM API we create 20-second intervals. )
+              (last_ts + 20.seconds..ts).step_value(20.seconds).each do |inner_ts|
+                  counter_values_by_ts.store_path(inner_ts.iso8601, i[:vim_style_counter_key], value) if not value.nil?
+              end
+          end
+        end
+      end 
+    end.uniq.compact.sort
 
     counters_by_id              = {target.ems_ref => VIM_STYLE_COUNTERS}
     counter_values_by_id_and_ts = {target.ems_ref => counter_values_by_ts}
+    _log.info(counter_values_by_ts)
+
     return counters_by_id, counter_values_by_id_and_ts
   end
 
-  def counter_values_by_timestamp(metrics_by_counter_name)
-    counter_values_by_ts = {}
-    COUNTER_INFO.each do |i|
-      timestamps = i[:native_counters].flat_map do |c|
-        metrics_by_counter_name[c]&.keys
-      end.uniq.compact.sort
-
-      timestamps.each_cons(2) do |last_ts, ts|
-        metrics = i[:native_counters].collect { |c| metrics_by_counter_name.fetch_path(c, ts) }
-        value = i[:calculation].call(metrics.compact)
-
-        # For (temporary) symmetry with VIM API we create 20-second intervals.
-        (last_ts + 20.seconds..ts).step_value(20.seconds).each do |inner_ts|
-          counter_values_by_ts.store_path(inner_ts.iso8601, i[:vim_style_counter_key], value)
-        end
-      end
-    end
-    counter_values_by_ts
-  end
-
-  def metrics_by_counter_name(storage_conn, counters, start_time, end_time)
-    counters.each_with_object({}) do |c, h|
-      metrics = h[c.name.value] = {}
-
-      raw_metrics, _timings = Benchmark.realtime_block(:capture_counter_values) do
-        raw_metrics_for_counter(storage_conn, c, start_time, end_time)
-      end
-
-      raw_metrics.each { |m| metrics[Time.parse(m._timestamp)] = m.average }
-    end
-  end
-
-  def raw_metrics_for_counter(storage_conn, counter, start_time, end_time)
-    # TODO: We should really find the availabilities that
-    #       a) match the time range
-    #       b) are other sizes than 1-minute time grains
-    # TODO: This should live in the azure-armrest gem as a general method for
-    #       capturing metrics for a target.
-    availability = counter.metric_availabilities.detect { |ma| ma.time_grain == INTERVAL_1_MINUTE }
-    return [] if availability.nil?
-
-    table_name = availability.location.table_info.last.try(:table_name)
-    return [] if table_name.nil?
-
-    endpoint      = availability.location.table_endpoint
-    partition_key = availability.location.partition_key
-
-    storage_acct_name = URI.parse(endpoint).host.split('.').first
-    storage_account   = storage_accounts(storage_conn).find { |account| account.name == storage_acct_name }
-    storage_key       = storage_conn.list_account_keys(storage_account.name, storage_account.resource_group).fetch('key1')
-
-    filter = "PartitionKey eq '#{partition_key}' and CounterName eq '#{counter.name.value}' and Timestamp ge datetime'#{start_time.iso8601}' and Timestamp le datetime'#{end_time.iso8601}'"
-
-    fields = 'Timestamp,TIMESTAMP,Average'
-
-    storage_account.table_data(
-      table_name,
-      storage_key,
-      :filter => filter,
-      :select => fields,
-      :all    => true
-    )
+ ##Compose it to be azure vm id 
+  def azure_vm_id
+    ems_ref_parts = target.ems_ref.split('/')
+    vm_id = File.join("subscriptions",
+      ems_ref_parts[0],
+      "resourceGroups",
+      ems_ref_parts[1],
+      "providers",
+      ems_ref_parts[2],
+      "virtualMachines",
+      ems_ref_parts[4])
+      return vm_id
   end
 
   def get_counters(metrics_conn)
@@ -205,9 +176,12 @@ class ManageIQ::Providers::Azure::CloudManager::MetricsCapture < ManageIQ::Provi
 
     begin
       counters, _timings = Benchmark.realtime_block(:capture_counters) do
+        
+       
+        
         metrics_conn
-          .list('Microsoft.Compute', 'virtualMachines', target.name, target.resource_group.name)
-          .select { |m| m.name.value.in?(COUNTER_NAMES) }
+          .list_definitions(azure_vm_id)
+          .select { |m| COUNTER_NAMES.include?(m.name.value) }
       end
     rescue ::Azure::Armrest::BadRequestException # Probably means region is not supported
       msg = "Problem collecting metrics for #{target.name}/#{target.resource_group.name}. "\
